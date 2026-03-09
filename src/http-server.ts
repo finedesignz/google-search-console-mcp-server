@@ -165,7 +165,7 @@ function classifyError(error: Error): number {
  * Error handling middleware
  */
 function errorHandler(
-  error: Error,
+  error: Error & { code?: number; status?: number; type?: string },
   _req: Request,
   res: Response,
   _next: NextFunction
@@ -173,7 +173,16 @@ function errorHandler(
   // Log full error server-side only
   console.error('[HTTP] Error:', error.message);
 
-  if (error instanceof McpError) {
+  // Handle Express body-parser errors (e.g. entity too large)
+  if (error.status && error.type) {
+    res.status(error.status).json({
+      error: { code: error.type, message: error.message },
+    });
+    return;
+  }
+
+  // Handle MCP errors (duck-type check for cross-module compatibility)
+  if (typeof error.code === 'number') {
     let statusCode: number;
     if (error.code === ErrorCode.InvalidParams) {
       statusCode = 400;
@@ -185,17 +194,16 @@ function errorHandler(
     res.status(statusCode).json({
       error: { code: error.code, message: error.message },
     });
-  } else {
-    const statusCode = classifyError(error);
-    // Return sanitized error - don't leak internal details
-    const safeMessage =
-      statusCode === 500
-        ? 'An internal error occurred'
-        : error.message;
-    res.status(statusCode).json({
-      error: { code: 'error', message: safeMessage },
-    });
+    return;
   }
+
+  // Generic errors - classify by message content
+  const statusCode = classifyError(error);
+  const safeMessage =
+    statusCode === 500 ? 'An internal error occurred' : error.message;
+  res.status(statusCode).json({
+    error: { code: 'error', message: safeMessage },
+  });
 }
 
 /**
