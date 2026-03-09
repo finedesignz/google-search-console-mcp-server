@@ -6,6 +6,7 @@
  * Token refresh is handled automatically by the googleapis library.
  */
 
+import { timingSafeEqual } from 'crypto';
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
@@ -66,17 +67,35 @@ function extractCredentials(req: Request): GSCCredentials | null {
 }
 
 /**
+ * Constant-time string comparison to prevent timing attacks
+ */
+function safeCompare(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
+/**
  * Middleware: validate API key if configured
  */
 function apiKeyMiddleware(req: Request, res: Response, next: NextFunction) {
   const apiKey = process.env.MCP_API_KEY;
   if (!apiKey) {
+    // No API key configured - allow unauthenticated access
+    // Credentials are still required per-request for tool calls
     next();
     return;
   }
 
-  const authHeader = req.headers['authorization'] || '';
-  if (authHeader === `Bearer ${apiKey}`) {
+  // Skip API key check for health endpoint
+  if (req.path === '/health') {
+    next();
+    return;
+  }
+
+  const authHeader = (req.headers['authorization'] as string) || '';
+  if (safeCompare(authHeader, `Bearer ${apiKey}`)) {
     next();
     return;
   }
@@ -91,7 +110,11 @@ function apiKeyMiddleware(req: Request, res: Response, next: NextFunction) {
  */
 function credentialsMiddleware(req: Request, res: Response, next: NextFunction) {
   // Skip for health/info endpoints
-  if (req.path === '/health' || req.path === '/mcp' || (req.path === '/tools' && req.method === 'GET')) {
+  if (
+    req.path === '/health' ||
+    req.path === '/mcp' ||
+    (req.path === '/tools' && req.method === 'GET')
+  ) {
     next();
     return;
   }
@@ -113,6 +136,32 @@ function credentialsMiddleware(req: Request, res: Response, next: NextFunction) 
 }
 
 /**
+ * Classify error for appropriate HTTP status code
+ */
+function classifyError(error: Error): number {
+  const msg = error.message.toLowerCase();
+  if (
+    msg.includes('invalid_client') ||
+    msg.includes('invalid_grant') ||
+    msg.includes('unauthorized') ||
+    msg.includes('token has been expired') ||
+    msg.includes('token has been revoked')
+  ) {
+    return 401;
+  }
+  if (msg.includes('forbidden') || msg.includes('permission')) {
+    return 403;
+  }
+  if (msg.includes('not found') || msg.includes('does not exist')) {
+    return 404;
+  }
+  if (msg.includes('rate limit') || msg.includes('quota')) {
+    return 429;
+  }
+  return 500;
+}
+
+/**
  * Error handling middleware
  */
 function errorHandler(
@@ -121,16 +170,30 @@ function errorHandler(
   res: Response,
   _next: NextFunction
 ) {
+  // Log full error server-side only
   console.error('[HTTP] Error:', error.message);
 
   if (error instanceof McpError) {
-    const statusCode = error.code === ErrorCode.InvalidParams ? 400 : 500;
+    let statusCode: number;
+    if (error.code === ErrorCode.InvalidParams) {
+      statusCode = 400;
+    } else if (error.code === ErrorCode.MethodNotFound) {
+      statusCode = 404;
+    } else {
+      statusCode = 500;
+    }
     res.status(statusCode).json({
       error: { code: error.code, message: error.message },
     });
   } else {
-    res.status(500).json({
-      error: { code: 'internal_error', message: error.message || 'Internal server error' },
+    const statusCode = classifyError(error);
+    // Return sanitized error - don't leak internal details
+    const safeMessage =
+      statusCode === 500
+        ? 'An internal error occurred'
+        : error.message;
+    res.status(statusCode).json({
+      error: { code: 'error', message: safeMessage },
     });
   }
 }
@@ -144,10 +207,23 @@ export function createHttpServer(port = 9100): {
 } {
   const app = express();
 
-  app.use(cors());
-  app.use(express.json());
+  // Security: restrict CORS to configured origins, or allow all if not set
+  const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',');
+  app.use(
+    cors(
+      allowedOrigins
+        ? { origin: allowedOrigins }
+        : undefined
+    )
+  );
+
+  // Body size limit to prevent oversized payloads
+  app.use(express.json({ limit: '100kb' }));
   app.use(apiKeyMiddleware);
   app.use(credentialsMiddleware);
+
+  // Disable x-powered-by header
+  app.disable('x-powered-by');
 
   // Health check
   app.get('/health', (_req, res) => {
@@ -255,6 +331,12 @@ export function createHttpServer(port = 9100): {
   return {
     app,
     async start() {
+      if (!process.env.MCP_API_KEY) {
+        console.warn(
+          'WARNING: MCP_API_KEY not set. Tool endpoints require GSC credentials but have no API key gate.'
+        );
+      }
+
       return new Promise<void>((resolve) => {
         app.listen(port, '0.0.0.0', () => {
           console.log(`Google Search Console MCP Server (HTTP Mode)`);
@@ -262,7 +344,9 @@ export function createHttpServer(port = 9100): {
           console.log(`  Health: http://localhost:${port}/health`);
           console.log(`  Tools: http://localhost:${port}/tools`);
           console.log(`\nCredentials: Provide via headers per request`);
-          console.log(`  GSC-Client-ID, GSC-Client-Secret, GSC-Refresh-Token`);
+          console.log(
+            `  GSC-Client-ID, GSC-Client-Secret, GSC-Refresh-Token`
+          );
           resolve();
         });
       });
