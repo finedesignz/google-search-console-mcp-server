@@ -1,9 +1,10 @@
 # Stage 1: Build
 FROM node:20-alpine AS builder
 WORKDIR /app
+ENV NODE_ENV=development
 COPY package*.json tsconfig.json ./
 COPY src ./src
-RUN npm ci
+RUN npm ci --ignore-scripts && npm run build
 
 # Stage 2: Production
 FROM node:20-alpine
